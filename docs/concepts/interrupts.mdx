@@ -242,6 +242,138 @@ approve-with-edits:
 `editedArgs` is a full replacement, not a partial merge. Its presence in the
 schema is the **capability signal** that the client may offer edit UI.
 
+## Consent binding
+
+`resume[].metadata` already names the case: _"a signature proving the human
+decision was not tampered with."_ This section defines, as an **optional,
+additive** convention under the reserved `ag-ui` key, _what that signature
+covers_ — so a consequential approval (a payment, a transfer, a destructive
+action) is bound to the exact thing the human was shown and the agent is about
+to do.
+
+The gap it closes is **render→act drift**: AG-UI carries generative-UI surfaces
+(A2UI, MCP-UI, …) on one side and the `resume` decision on the other, and the
+base contract binds neither to the other. So a fully conformant run can display
+one amount and dispatch another — "show X, settle Y." Adjacent domains close the
+same gap: PSD2 _dynamic linking_ (the authorization is bound to amount + payee;
+any change invalidates it) and EIP-712 / ERC-7730 _clear-signing_ in wallets.
+
+### The `consent` object
+
+A client resolving a consequential interrupt MAY attach a `consent` object under
+`metadata["ag-ui"]`:
+
+```typescript
+type ConsentBinding = {
+  alg: "sha256"          // digest algorithm
+  digest: string         // base64; see "What the digest covers"
+  interruptId: string    // the interrupt this consent resolves
+  nonce?: number         // thread-scoped replay guard
+  sig?: string           // optional signature over (alg, digest, interruptId, nonce)
+}
+```
+
+```json
+{
+  "interruptId": "int-pay-1",
+  "status": "resolved",
+  "payload": { "approved": true },
+  "metadata": {
+    "ag-ui": {
+      "consent": {
+        "alg": "sha256",
+        "digest": "9d2b…",
+        "interruptId": "int-pay-1",
+        "nonce": 7
+      }
+    }
+  }
+}
+```
+
+### What the digest covers
+
+`digest` is a deterministic hash, canonicalized with
+[RFC 8785 (JCS)](https://www.rfc-editor.org/rfc/rfc8785), over two things:
+
+1. **The resolved action** — the fields the agent will act on: the tool's
+   resolved arguments (including any `editedArgs`), or the resolved target of a
+   non-tool decision. A digest over canonical fields does not move when the
+   renderer changes layout, locale or number formatting.
+2. **The displayed value per field** — for each action field, the value the
+   surface showed for it, keyed by its role. This is what makes a canonical
+   digest _WYSIWYS_: it proves not only that the action did not change, but that
+   the surface showed _that_ action. A canonical-action hash alone passes the
+   "show X, settle Y" case; carrying the displayed value per field is what
+   catches it.
+
+Volatile inputs (an FX rate, a gas estimate) SHOULD travel as a separate bound
+quote with its own hash and validity window, referenced by the action, so a
+re-quote is a new quote and never reads as tampering. Geometry and styling are
+**out of scope** — only roles and resolved displayed values participate, so the
+binding survives presentation changes.
+
+### The gate
+
+The core is a **check at dispatch**, not a stored receipt. Before executing the
+resumed action, the verifier recomputes the digest over the action it is _about
+to perform_ and the values bound to it, and refuses on any mismatch. In an AG-UI
+stack the dispatch point is downstream of the renderer, so no trusted display is
+required — the binding covers the dispatched action.
+
+Scope, stated precisely: this is **integrity of the action about to be
+performed, not authenticity of what a human's eyes saw**. It catches a surface
+that drifted _after_ approval (render→act / TOCTOU). A renderer that lied
+_before_ approval is out of scope; that needs a surface the verifier owns.
+
+### Conformance vectors
+
+A verifier that implements consent binding **MUST refuse** when the digest does
+not recompute over the action it is about to dispatch, and **MUST accept** when
+it does.
+
+**Vector 1 — refuse (show X, settle Y).** The human was shown
+`0.10 USDC → 0xA1…demo`; the resumed action dispatches
+`0.90 USDC → 0xB7…attacker`. `consent.digest` was computed over the shown
+values, so it does not recompute over the dispatched action → the verifier MUST
+refuse and emit `RunError`.
+
+```json
+{
+  "shown":      { "amount": "0.10 USDC", "payee": "0xA1…demo" },
+  "dispatched": { "amount": "0.90 USDC", "payee": "0xB7…attacker" },
+  "consent":    { "alg": "sha256", "digest": "<computed over shown>", "interruptId": "int-pay-1" },
+  "expected":   "RunError (consent mismatch)"
+}
+```
+
+**Vector 2 — accept.** Shown and dispatched match; the digest recomputes, and
+the action proceeds.
+
+```json
+{
+  "shown":      { "amount": "0.10 USDC", "payee": "0xA1…demo" },
+  "dispatched": { "amount": "0.10 USDC", "payee": "0xA1…demo" },
+  "consent":    { "alg": "sha256", "digest": "<computed over shown>", "interruptId": "int-pay-1" },
+  "expected":   "accept"
+}
+```
+
+### Relationship to existing fields
+
+- **Opt-in and additive.** Absence of `consent` leaves every existing contract
+  unchanged. It is **not** an authorization credential — servers still validate
+  decisions (see [Server-owned tool execution](#server-owned-tool-execution)).
+- `interruptId` ties the binding to the same interrupt the `resume` resolves.
+- `nonce` is the thread-scoped replay guard; it complements idempotency rule 5
+  (a replay with the same `(threadId, interruptId, status, payload)` stays safe,
+  while the nonce lets a verifier reject a _re-presented_ binding).
+
+A protocol-neutral write-up with a normative byte layout and conformance
+vectors, and a reference implementation with this exact `resume[].metadata`
+shape, are linked from discussion
+[#3309](https://github.com/ag-ui-protocol/ag-ui/discussions/3309).
+
 ## Examples
 
 ### Minimal tool approval
